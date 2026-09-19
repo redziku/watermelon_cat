@@ -26,6 +26,10 @@ from openpyxl.worksheet.table import Table, TableStyleInfo
 from openpyxl.utils import get_column_letter
 from pptx import Presentation
 
+# 실행 로그에 찍어 어떤 버전이 돌았는지 확인할 수 있게 한다.
+# 스크립트를 고칠 때마다 올린다.
+VERSION = "2026-09-19d"
+
 # ── 템플릿 매핑 ──────────────────────────────────────────────
 # 슬라이드 상단 플레이스홀더의 도형 이름
 SHAPE_대분류 = "텍스트 개체 틀 3"
@@ -576,6 +580,7 @@ def main():
     if not targets:
         sys.exit(f"처리할 pptx 가 없습니다. ({source})")
 
+    print(f"ui_spec_extract {VERSION}")
     print(f"대상 {len(targets)}개 파일")
     doc_rows, list_rows, flow_rows, element_rows = [], [], [], []
     seen_docs = set()
