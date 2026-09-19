@@ -28,7 +28,7 @@ from pptx import Presentation
 
 # 실행 로그에 찍어 어떤 버전이 돌았는지 확인할 수 있게 한다.
 # 스크립트를 고칠 때마다 올린다.
-VERSION = "2026-09-19f"
+VERSION = "2026-09-19g"
 
 # ── 템플릿 매핑 ──────────────────────────────────────────────
 # 슬라이드 상단 플레이스홀더의 도형 이름
@@ -652,6 +652,29 @@ def make_console_safe():
             pass
 
 
+OUT_FILES = ["doc_list.csv", "ui_list.csv", "ui_flow.csv", "ui_element.csv",
+             "ui_spec.xlsx"]
+
+
+def locked_outputs(out):
+    """이미 열려 있어 덮어쓸 수 없는 산출물을 찾는다.
+
+    윈도우는 엑셀이 연 파일을 잠그기 때문에 저장이 실패한다. 파일을 다
+    읽은 뒤 마지막 저장에서 터지면 수 분을 그냥 날리므로 미리 검사한다.
+    """
+    blocked = []
+    for name in OUT_FILES:
+        path = out / name
+        if not path.exists():
+            continue
+        try:
+            with open(path, "r+b"):
+                pass
+        except OSError:
+            blocked.append(name)
+    return blocked
+
+
 def main():
     make_console_safe()
     ap = argparse.ArgumentParser(description="UI 설계서 PPTX → CSV/Excel 추출기")
@@ -668,6 +691,13 @@ def main():
         targets = [source]
     if not targets:
         sys.exit(f"처리할 pptx 가 없습니다. ({source})")
+
+    out = Path(args.out)
+    out.mkdir(parents=True, exist_ok=True)
+    blocked = locked_outputs(out)
+    if blocked:
+        sys.exit(f"[중단] 다음 파일이 열려 있어 저장할 수 없습니다 — {', '.join(blocked)}\n"
+                 f"       엑셀에서 {out.resolve()} 안의 파일을 닫고 다시 실행하세요.")
 
     print(f"ui_spec_extract {VERSION}")
     print(f"대상 {len(targets)}개 파일")
@@ -701,14 +731,17 @@ def main():
     unknown_areas = build_unknown_areas(element_rows)
     matrix = build_button_matrix(list_rows, element_rows, button_rows)
 
-    out = Path(args.out)
-    out.mkdir(parents=True, exist_ok=True)
     write_csv(out / "doc_list.csv", DOC_HEADERS, doc_rows)
     write_csv(out / "ui_list.csv", LIST_HEADERS, list_rows)
     write_csv(out / "ui_flow.csv", FLOW_HEADERS, flow_rows)
     write_csv(out / "ui_element.csv", ELEMENT_HEADERS, element_rows)
-    write_xlsx(out / "ui_spec.xlsx", doc_rows, list_rows, matrix, flow_rows,
-               element_rows, button_rows, dup_rows)
+    try:
+        write_xlsx(out / "ui_spec.xlsx", doc_rows, list_rows, matrix, flow_rows,
+                   element_rows, button_rows, dup_rows)
+    except PermissionError:
+        sys.exit("[중단] ui_spec.xlsx 를 저장할 수 없습니다. 실행 중에 엑셀에서 "
+                 "열린 것으로 보입니다.\n       엑셀을 닫고 다시 실행하세요. "
+                 "CSV 는 정상 저장됐습니다.")
     print(f"\n완료 → {out.resolve()}")
     print(f"  doc_list.csv   ({len(doc_rows)}행)")
     print(f"  ui_list.csv    ({len(list_rows)}행)")
