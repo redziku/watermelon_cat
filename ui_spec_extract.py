@@ -78,7 +78,10 @@ CONTEXT_HEADERS = ["UI_KEY", "문서번호", "버전", "슬라이드",
 FLOW_HEADERS = CONTEXT_HEADERS + ["섹션", "순번", "내용"]
 ELEMENT_HEADERS = CONTEXT_HEADERS + ["영역", "영역구분", "순번", "요소명"]
 BUTTON_HEADERS = ["버튼명", "사용_화면수", "사용_화면"]
-BTN_UI_HEADERS = ["UI_KEY", "대분류", "소분류", "UI_ID", "UI명", "UI유형", "버튼수", "버튼"]
+# 화면 × 버튼 매트릭스의 고정 컬럼. 이 뒤로 버튼 이름 컬럼이 붙는다.
+BTN_MATRIX_BASE = ["UI_KEY", "대분류", "소분류", "UI_ID", "UI명", "UI유형", "버튼수"]
+MARK = "●"
+MATRIX_BASE_WIDTHS = [42, 16, 22, 14, 30, 8, 8]
 
 # UI흐름 섹션 제목 → 와이드 시트 컬럼명. 없는 제목은 기타사항으로 모은다.
 SECTION_COL = {
@@ -285,9 +288,37 @@ def parse_areas(lines):
     return areas
 
 
-def build_buttons_by_ui(list_rows):
-    """화면 하나에 버튼이 무엇이 있는지만 남긴 간단한 표."""
-    return [{h: row[h] for h in BTN_UI_HEADERS} for row in list_rows]
+def build_button_matrix(list_rows, element_rows, button_rows):
+    """화면 × 버튼 매트릭스를 만든다.
+
+    버튼 컬럼은 많이 쓰이는 순으로 왼쪽에 둔다. 그래야 왼쪽 덩어리가
+    공통 버튼 세트가 되고, 거기 생긴 구멍이 곧 '이 화면엔 공통 버튼이
+    빠졌다' 는 신호로 눈에 들어온다.
+    """
+    used = {}
+    for element in element_rows:
+        if element["영역구분"] == "버튼":
+            used.setdefault(element["UI_KEY"], set()).add(element["요소명"])
+
+    # 버튼 이름이 고정 컬럼 이름과 겹치면 헤더가 중복돼 엑셀 표가 깨진다.
+    taken, columns = set(BTN_MATRIX_BASE), []
+    for button in button_rows:
+        name = button["버튼명"]
+        header = name
+        while header in taken:
+            header += "_"
+        taken.add(header)
+        columns.append((name, header))
+
+    headers = BTN_MATRIX_BASE + [header for _, header in columns]
+    rows = []
+    for row in list_rows:
+        have = used.get(row["UI_KEY"], set())
+        matrix_row = {h: row[h] for h in BTN_MATRIX_BASE}
+        for name, header in columns:
+            matrix_row[header] = MARK if name in have else ""
+        rows.append(matrix_row)
+    return headers, rows
 
 
 def build_unknown_areas(element_rows):
@@ -439,18 +470,59 @@ def add_sheet(wb, title, table_name, headers, rows, widths, wrap=True):
         ws.auto_filter.ref = ws.dimensions
 
 
-def write_xlsx(path, doc_rows, list_rows, btn_ui_rows, flow_rows, element_rows,
+def add_matrix_sheet(wb, title, table_name, headers, rows, base_count):
+    """고정 컬럼 + 표시 컬럼으로 된 매트릭스 시트."""
+    ws = wb.create_sheet(title)
+    ws.append(headers)
+    for i, cell in enumerate(ws[1], 1):
+        cell.font = Font(bold=True, color="FFFFFF")
+        cell.fill = PatternFill("solid", fgColor="4472C4")
+        # 버튼 이름은 세로로 세워야 컬럼을 좁게 두고도 다 읽힌다.
+        rotate = 90 if i > base_count else 0
+        cell.alignment = Alignment(horizontal="center",
+                                   vertical="bottom" if rotate else "center",
+                                   textRotation=rotate)
+    for row in rows:
+        ws.append([row[h] for h in headers])
+
+    ws.row_dimensions[1].height = 95
+    for i in range(1, len(headers) + 1):
+        letter = get_column_letter(i)
+        ws.column_dimensions[letter].width = (
+            MATRIX_BASE_WIDTHS[i - 1] if i <= base_count else 4.2)
+
+    mark_fill = PatternFill("solid", fgColor="9DC3E6")
+    for row in ws.iter_rows(min_row=2):
+        for i, cell in enumerate(row, 1):
+            if i <= base_count:
+                cell.alignment = Alignment(vertical="center")
+                continue
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+            if cell.value == MARK:
+                cell.fill = mark_fill
+
+    ws.freeze_panes = f"{get_column_letter(base_count + 1)}2"
+    if rows:
+        table = Table(displayName=table_name, ref=ws.dimensions)
+        table.tableStyleInfo = TableStyleInfo(name="TableStyleLight1",
+                                              showRowStripes=False)
+        ws.add_table(table)
+
+
+def write_xlsx(path, doc_rows, list_rows, matrix, flow_rows, element_rows,
                button_rows, dup_rows):
     wb = Workbook()
     wb.remove(wb.active)
     context_widths = [42, 18, 8, 8, 16, 16, 20, 14, 26, 10]
     add_sheet(wb, "문서", "t_doc", DOC_HEADERS, doc_rows,
               [42, 46, 18, 20, 32, 14, 8, 14, 10])
+    _ = MATRIX_BASE_WIDTHS  # 매트릭스 시트가 쓰는 고정 컬럼 폭
     add_sheet(wb, "UI목록", "t_ui", LIST_HEADERS, list_rows,
               [42, 46, 18, 8, 8, 16, 16, 20, 26, 14, 10, 22, 40,
                44, 44, 44, 24, 10, 8, 8, 50, 40])
-    add_sheet(wb, "화면별버튼", "t_btn_ui", BTN_UI_HEADERS, btn_ui_rows,
-              [42, 16, 22, 14, 30, 8, 8, 70])
+    matrix_headers, matrix_rows = matrix
+    add_matrix_sheet(wb, "화면별버튼", "t_btn_ui", matrix_headers, matrix_rows,
+                     len(BTN_MATRIX_BASE))
     # 피벗 소스 두 장은 줄바꿈 없이 한 줄로 둬야 스크롤하며 훑기 좋다.
     add_sheet(wb, "화면요소", "t_element", ELEMENT_HEADERS, element_rows,
               context_widths + [18, 10, 6, 34], wrap=False)
@@ -515,10 +587,10 @@ def main():
         list_rows.extend(rows)
         flow_rows.extend(flows)
         element_rows.extend(elements)
-    btn_ui_rows = build_buttons_by_ui(list_rows)
     button_rows = build_button_inventory(element_rows)
     dup_rows = build_duplicates(list_rows)
     unknown_areas = build_unknown_areas(element_rows)
+    matrix = build_button_matrix(list_rows, element_rows, button_rows)
 
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -526,7 +598,7 @@ def main():
     write_csv(out / "ui_list.csv", LIST_HEADERS, list_rows)
     write_csv(out / "ui_flow.csv", FLOW_HEADERS, flow_rows)
     write_csv(out / "ui_element.csv", ELEMENT_HEADERS, element_rows)
-    write_xlsx(out / "ui_spec.xlsx", doc_rows, list_rows, btn_ui_rows, flow_rows,
+    write_xlsx(out / "ui_spec.xlsx", doc_rows, list_rows, matrix, flow_rows,
                element_rows, button_rows, dup_rows)
     print(f"\n완료 → {out.resolve()}")
     print(f"  doc_list.csv   ({len(doc_rows)}행)")
