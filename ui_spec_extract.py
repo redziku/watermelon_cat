@@ -28,7 +28,7 @@ from pptx import Presentation
 
 # 실행 로그에 찍어 어떤 버전이 돌았는지 확인할 수 있게 한다.
 # 스크립트를 고칠 때마다 올린다.
-VERSION = "2026-09-19e"
+VERSION = "2026-09-19f"
 
 # ── 템플릿 매핑 ──────────────────────────────────────────────
 # 슬라이드 상단 플레이스홀더의 도형 이름
@@ -52,6 +52,8 @@ RE_제어문자 = re.compile(r"[\x00-\x08\x0e-\x1f]")
 # 문서명은 'BI포탈_신용실적 – 04.여신실적(1)' 처럼 뒤에 편 이름이 붙는다.
 # 공백으로 둘러싸인 대시만 구분자로 봐야 'NHNIS-BC-DS03' 이 잘리지 않는다.
 SEP_문서명 = re.compile(r"\s[–—-]\s")
+# 한 화면을 여러 장에 나눠 그린 경우 UI명 끝에 '(1/2)' 처럼 쪽 표기가 붙는다.
+RE_분할 = re.compile(r"\s*\((\d+)\s*/\s*(\d+)\)\s*$")
 RE_버전 = re.compile(r"^\d+(\.\d+)*$")
 RE_작성일 = re.compile(r"^\d{4}[.\-/]\d{1,2}[.\-/]\d{1,2}\.?$")
 
@@ -70,7 +72,8 @@ DOC_HEADERS = ["문서키", "파일명", "문서번호", "구분", "문서명", 
                "버전", "작성일", "UI건수"]
 DUP_HEADERS = ["UI_ID", "중복수", "UI명", "출처"]
 LIST_HEADERS = [
-    "UI_KEY", "파일명", "문서번호", "버전", "슬라이드", "대분류", "중분류", "소분류",
+    "UI_KEY", "파일명", "문서번호", "버전", "슬라이드", "슬라이드_전체", "분할쪽수",
+    "대분류", "중분류", "소분류",
     "UI명", "UI_ID", "UI유형", "UI유형_원문", "UI설명",
     "조회조건", "입력", "버튼", "데이터", "기타영역",
     "조회조건수", "입력수", "버튼수", "데이터수",
@@ -127,6 +130,23 @@ AREA_KIND = [
     ("등록", "입력"),
     ("입력", "입력"),
 ]
+
+
+def split_page(name):
+    """'이름(1/2)' 을 ('이름', 1, 2) 로 나눈다. 표기가 없으면 쪽 정보는 None."""
+    found = RE_분할.search(name)
+    if not found:
+        return name, None, None
+    return name[:found.start()].strip(), int(found.group(1)), int(found.group(2))
+
+
+def join_unique(values):
+    """비어 있지 않은 값을 순서대로, 같은 내용은 한 번만 이어 붙인다."""
+    picked = []
+    for value in values:
+        if value and value not in picked:
+            picked.append(value)
+    return "\n".join(picked)
 
 
 def clean_text(text):
@@ -371,6 +391,18 @@ def build_button_inventory(element_rows):
     return rows
 
 
+def fill_area_columns(row, element_rows):
+    """화면 정의를 영역구분별로 묶어 UI목록에서 한 줄로 훑어볼 수 있게 한다."""
+    by_kind = OrderedDict()
+    for element in element_rows:
+        by_kind.setdefault(element["영역구분"], []).append(element["요소명"])
+    for kind, (list_col, count_col) in AREA_COL.items():
+        picked = by_kind.get(kind, [])
+        row[list_col] = ", ".join(picked)
+        if count_col:
+            row[count_col] = len(picked)
+
+
 def extract_slide(pptx_name, meta, slide_no, slide, table):
     sections = parse_flow(table)
     ui_key = make_ui_key(meta, slide_no)
@@ -392,6 +424,11 @@ def extract_slide(pptx_name, meta, slide_no, slide, table):
             warnings.append(f"슬라이드 {slide_no}: 라벨이 '{expected}' 가 아니라 '{actual}' 입니다")
         row[field] = cell_text(table, *value_pos)
     row["UI유형"] = normalize_ui_type(row["UI유형_원문"])
+    # 한 화면이 여러 장에 걸쳐 있으면 이름 끝의 쪽 표기를 떼어 둔다.
+    # 이름이 같아져야 뒤에서 한 화면으로 합칠 수 있다.
+    row["UI명"], page, pages = split_page(row["UI명"])
+    row["슬라이드_전체"] = str(slide_no)
+    row["분할쪽수"] = pages or 1
 
     # 화면 정의를 뺀 나머지 섹션을 해당 컬럼에 담는다.
     기타 = []
@@ -423,17 +460,60 @@ def extract_slide(pptx_name, meta, slide_no, slide, table):
                 element_rows.append({**context, "영역": area, "영역구분": kind,
                                      "순번": i, "요소명": element})
 
-    # 화면 정의를 영역구분별로 묶어 UI목록에서 한 줄로 훑어볼 수 있게 한다.
-    by_kind = OrderedDict()
-    for element in element_rows:
-        by_kind.setdefault(element["영역구분"], []).append(element["요소명"])
-    for kind, (list_col, count_col) in AREA_COL.items():
-        picked = by_kind.get(kind, [])
-        row[list_col] = ", ".join(picked)
-        if count_col:
-            row[count_col] = len(picked)
-
+    fill_area_columns(row, element_rows)
     return row, flow_rows, element_rows, warnings
+
+
+def merge_split_uis(list_rows, flow_rows, element_rows):
+    """'(1/2)(2/2)' 로 나뉜 슬라이드를 한 화면으로 합친다.
+
+    합치는 대상은 쪽 표기가 있고 UI_ID 와 이름이 같은 것뿐이라,
+    표기 없는 화면이 휩쓸려 합쳐지는 일은 없다. 두 장에 같은 흐름이
+    복사돼 있는 경우가 많아, 이어 붙일 때 같은 내용은 한 번만 남긴다.
+    """
+    groups, warnings = OrderedDict(), []
+    for i, row in enumerate(list_rows):
+        key = (row["UI_ID"], row["UI명"]) if row["분할쪽수"] > 1 else ("단독", i)
+        groups.setdefault(key, []).append(row)
+
+    merged, remap = [], {}
+    for rows in groups.values():
+        head = rows[0]
+        for row in rows:
+            remap[row["UI_KEY"]] = head["UI_KEY"]
+        if len(rows) > 1:
+            head["슬라이드_전체"] = ", ".join(str(r["슬라이드"]) for r in rows)
+            for col in ("UI설명", "업무처리흐름", "기타사항"):
+                head[col] = join_unique(r[col] for r in rows)
+        if head["분할쪽수"] != len(rows):
+            warnings.append(f"{head['UI명']}: 쪽 표기는 {head['분할쪽수']}장인데 "
+                            f"슬라이드는 {len(rows)}장입니다")
+        head["분할쪽수"] = len(rows)
+        merged.append(head)
+
+    def rebuild(rows, mark_cols, order_col):
+        kept, seen, counter = [], set(), OrderedDict()
+        for row in rows:
+            row["UI_KEY"] = remap[row["UI_KEY"]]
+            mark = (row["UI_KEY"],) + tuple(row[c] for c in mark_cols)
+            if mark in seen:
+                continue
+            seen.add(mark)
+            group = (row["UI_KEY"], row[order_col])
+            counter[group] = counter.get(group, 0) + 1
+            row["순번"] = counter[group]
+            kept.append(row)
+        return kept
+
+    flow_rows = rebuild(flow_rows, ("섹션", "내용"), "섹션")
+    element_rows = rebuild(element_rows, ("영역", "요소명"), "영역")
+
+    by_ui = OrderedDict()
+    for element in element_rows:
+        by_ui.setdefault(element["UI_KEY"], []).append(element)
+    for row in merged:
+        fill_area_columns(row, by_ui.get(row["UI_KEY"], []))
+    return merged, flow_rows, element_rows, warnings
 
 
 def extract_file(path, seen_docs):
@@ -454,6 +534,9 @@ def extract_file(path, seen_docs):
         flow_rows.extend(f)
         element_rows.extend(e)
         warnings.extend(w)
+    list_rows, flow_rows, element_rows, merge_warnings = merge_split_uis(
+        list_rows, flow_rows, element_rows)
+    warnings.extend(merge_warnings)
     meta["UI건수"] = len(list_rows)
     return meta, list_rows, flow_rows, element_rows, warnings
 
@@ -543,7 +626,7 @@ def write_xlsx(path, doc_rows, list_rows, matrix, flow_rows, element_rows,
               [42, 46, 18, 20, 32, 14, 8, 14, 10])
     _ = MATRIX_BASE_WIDTHS  # 매트릭스 시트가 쓰는 고정 컬럼 폭
     add_sheet(wb, "UI목록", "t_ui", LIST_HEADERS, list_rows,
-              [42, 46, 18, 8, 8, 16, 16, 20, 26, 14, 10, 22, 40,
+              [42, 46, 18, 8, 8, 12, 8, 16, 16, 20, 26, 14, 10, 22, 40,
                44, 44, 44, 44, 24, 10, 8, 8, 8, 50, 40])
     matrix_headers, matrix_rows = matrix
     add_matrix_sheet(wb, "화면별버튼", "t_btn_ui", matrix_headers, matrix_rows,
