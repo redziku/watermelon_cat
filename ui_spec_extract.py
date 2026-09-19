@@ -5,11 +5,14 @@
 출력
     <출력폴더>/ui_list.csv   UI 1개 = 1행 (와이드)
     <출력폴더>/ui_flow.csv   흐름 항목 1개 = 1행 (롱)
-    <출력폴더>/ui_spec.xlsx  위 두 개를 시트로 담은 엑셀
+    <출력폴더>/ui_element.csv 화면 구성요소 1개 = 1행 (버튼 인벤토리용)
+    <출력폴더>/ui_spec.xlsx  위를 시트로 담은 엑셀
 """
 import argparse
 import csv
+import re
 import sys
+from collections import OrderedDict
 from pathlib import Path
 
 from openpyxl import Workbook
@@ -40,6 +43,9 @@ LIST_HEADERS = [
     "화면정의", "업무처리흐름", "기타사항",
 ]
 FLOW_HEADERS = ["파일명", "슬라이드", "UI_ID", "UI명", "섹션", "순번", "내용"]
+ELEMENT_HEADERS = ["파일명", "슬라이드", "UI_ID", "UI명", "UI유형",
+                   "영역", "영역구분", "순번", "요소명"]
+BUTTON_HEADERS = ["버튼명", "사용_화면수", "사용_화면"]
 
 # UI흐름 섹션 제목 → 와이드 시트 컬럼명. 없는 제목은 기타사항으로 모은다.
 SECTION_COL = {
@@ -47,6 +53,19 @@ SECTION_COL = {
     "화면의 업무처리 흐름 정의": "업무처리흐름",
     "기타 제약조건 및 특이사항": "기타사항",
 }
+SECTION_화면정의 = "화면정의"
+
+# '<영역명> : a, b, c' 를 쪼갤 때 쓰는 구분자
+AREA_SEP = re.compile(r"[:：]")
+# 영역 이름이 문서마다 달라서(버튼 영역 / 출력 조건 영역 / 보고서결과 영역 …)
+# 키워드로 분류한다. 위에서부터 먼저 맞는 것을 쓴다.
+AREA_KIND = [
+    ("버튼", "버튼"),
+    ("조건", "조회조건"),
+    ("조회", "조회조건"),
+    ("데이터", "데이터"),
+    ("결과", "데이터"),
+]
 
 
 def cell_text(table, row, col):
@@ -103,6 +122,63 @@ def parse_flow(table):
     return sections
 
 
+def split_items(text):
+    """콤마로 나누되 괄호 안의 콤마는 무시한다.
+
+    '전일(실적, 대비)' 를 '전일(실적' / '대비)' 로 쪼개지 않기 위함이다.
+    """
+    items, buf, depth = [], [], 0
+    for ch in text:
+        if ch in "(（":
+            depth += 1
+        elif ch in ")）":
+            depth = max(depth - 1, 0)
+        if ch == "," and depth == 0:
+            items.append("".join(buf))
+            buf = []
+        else:
+            buf.append(ch)
+    items.append("".join(buf))
+    # 원본에 '기준일,  사무소' 처럼 공백이 겹친 곳이 있어 한 칸으로 정리한다.
+    return [" ".join(i.split()) for i in items if i.strip()]
+
+
+def classify_area(name):
+    for keyword, kind in AREA_KIND:
+        if keyword in name:
+            return kind
+    return "기타"
+
+
+def parse_areas(lines):
+    """화면 정의 항목을 (영역명, 영역구분, [요소]) 로 만든다."""
+    areas = []
+    for line in lines:
+        parts = AREA_SEP.split(line, 1)
+        if len(parts) == 2:
+            name = " ".join(parts[0].split())
+            areas.append((name, classify_area(name), split_items(parts[1])))
+        else:
+            areas.append(("(미분류)", "기타", [" ".join(line.split())]))
+    return areas
+
+
+def build_button_inventory(element_rows):
+    """버튼 요소를 버튼명 기준으로 묶어 어느 화면에서 쓰는지 집계한다."""
+    used = OrderedDict()
+    for row in element_rows:
+        if row["영역구분"] != "버튼":
+            continue
+        screens = used.setdefault(row["요소명"], [])
+        label = f"{row['UI명']}({row['UI_ID']})"
+        if label not in screens:
+            screens.append(label)
+    rows = [{"버튼명": name, "사용_화면수": len(screens), "사용_화면": ", ".join(screens)}
+            for name, screens in used.items()]
+    rows.sort(key=lambda r: (-r["사용_화면수"], r["버튼명"]))
+    return rows
+
+
 def extract_slide(pptx_name, slide_no, slide, table):
     sections = parse_flow(table)
 
@@ -139,21 +215,34 @@ def extract_slide(pptx_name, slide_no, slide, table):
                 "UI_ID": row["UI_ID"], "UI명": row["UI명"],
                 "섹션": title, "순번": i, "내용": item,
             })
-    return row, flow_rows, warnings
+
+    element_rows = []
+    for title, items in sections:
+        if SECTION_COL.get(title) != SECTION_화면정의:
+            continue
+        for area, kind, elements in parse_areas(items):
+            for i, element in enumerate(elements, 1):
+                element_rows.append({
+                    "파일명": pptx_name, "슬라이드": slide_no,
+                    "UI_ID": row["UI_ID"], "UI명": row["UI명"], "UI유형": row["UI유형"],
+                    "영역": area, "영역구분": kind, "순번": i, "요소명": element,
+                })
+    return row, flow_rows, element_rows, warnings
 
 
 def extract_file(path):
     prs = Presentation(str(path))
-    list_rows, flow_rows, warnings = [], [], []
+    list_rows, flow_rows, element_rows, warnings = [], [], [], []
     for slide_no, slide in enumerate(prs.slides, 1):
         table = find_spec_table(slide)
         if table is None:
             continue
-        r, f, w = extract_slide(path.name, slide_no, slide, table)
+        r, f, e, w = extract_slide(path.name, slide_no, slide, table)
         list_rows.append(r)
         flow_rows.extend(f)
+        element_rows.extend(e)
         warnings.extend(w)
-    return list_rows, flow_rows, warnings
+    return list_rows, flow_rows, element_rows, warnings
 
 
 def write_csv(path, headers, rows):
@@ -182,13 +271,17 @@ def add_sheet(wb, title, headers, rows, widths):
     ws.auto_filter.ref = ws.dimensions
 
 
-def write_xlsx(path, list_rows, flow_rows):
+def write_xlsx(path, list_rows, flow_rows, element_rows, button_rows):
     wb = Workbook()
     wb.remove(wb.active)
     add_sheet(wb, "UI목록", LIST_HEADERS, list_rows,
               [28, 8, 16, 16, 20, 26, 14, 10, 22, 40, 50, 50, 40])
     add_sheet(wb, "UI흐름_상세", FLOW_HEADERS, flow_rows,
               [28, 8, 14, 26, 24, 6, 80])
+    add_sheet(wb, "화면요소", ELEMENT_HEADERS, element_rows,
+              [28, 8, 14, 26, 10, 18, 10, 6, 34])
+    add_sheet(wb, "버튼인벤토리", BUTTON_HEADERS, button_rows,
+              [18, 12, 70])
     wb.save(path)
 
 
@@ -206,24 +299,28 @@ def main():
     if not targets:
         sys.exit(f"처리할 pptx 가 없습니다. ({source})")
 
-    list_rows, flow_rows = [], []
+    list_rows, flow_rows, element_rows = [], [], []
     for target in targets:
-        rows, flows, warnings = extract_file(target)
+        rows, flows, elements, warnings = extract_file(target)
         for w in warnings:
             print(f"[경고] {target.name} — {w}", file=sys.stderr)
-        print(f"{target.name}: UI {len(rows)}건, 흐름 항목 {len(flows)}건")
+        print(f"{target.name}: UI {len(rows)}건, 흐름 항목 {len(flows)}건, 화면요소 {len(elements)}건")
         list_rows.extend(rows)
         flow_rows.extend(flows)
+        element_rows.extend(elements)
+    button_rows = build_button_inventory(element_rows)
 
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     write_csv(out / "ui_list.csv", LIST_HEADERS, list_rows)
     write_csv(out / "ui_flow.csv", FLOW_HEADERS, flow_rows)
-    write_xlsx(out / "ui_spec.xlsx", list_rows, flow_rows)
+    write_csv(out / "ui_element.csv", ELEMENT_HEADERS, element_rows)
+    write_xlsx(out / "ui_spec.xlsx", list_rows, flow_rows, element_rows, button_rows)
     print(f"\n완료 → {out.resolve()}")
-    print(f"  ui_list.csv  ({len(list_rows)}행)")
-    print(f"  ui_flow.csv  ({len(flow_rows)}행)")
-    print("  ui_spec.xlsx (UI목록 / UI흐름_상세)")
+    print(f"  ui_list.csv    ({len(list_rows)}행)")
+    print(f"  ui_flow.csv    ({len(flow_rows)}행)")
+    print(f"  ui_element.csv ({len(element_rows)}행, 버튼 {len(button_rows)}종)")
+    print("  ui_spec.xlsx   (UI목록 / UI흐름_상세 / 화면요소 / 버튼인벤토리)")
 
 
 if __name__ == "__main__":
