@@ -6,7 +6,11 @@
     <출력폴더>/ui_list.csv   UI 1개 = 1행 (와이드)
     <출력폴더>/ui_flow.csv   흐름 항목 1개 = 1행 (롱)
     <출력폴더>/ui_element.csv 화면 구성요소 1개 = 1행 (버튼 인벤토리용)
+    <출력폴더>/doc_list.csv  문서(PPTX) 1개 = 1행
     <출력폴더>/ui_spec.xlsx  위를 시트로 담은 엑셀
+
+여러 파일을 한 번에 처리하면 모든 산출물이 하나로 합쳐지며,
+UI_KEY 컬럼이 문서를 가로질러 UI 하나를 가리키는 키가 된다.
 """
 import argparse
 import csv
@@ -26,6 +30,19 @@ SHAPE_대분류 = "텍스트 개체 틀 3"
 SHAPE_중분류 = "텍스트 개체 틀 4"
 SHAPE_소분류 = "제목 1"
 
+# 표지 슬라이드(레이아웃 이름 '표지')의 도형 이름 → 문서 메타 필드.
+# 본문 슬라이드에도 같은 이름의 도형이 있으므로 반드시 표지에서만 읽는다.
+LAYOUT_표지 = "표지"
+COVER_MAP = {
+    "제목 1": "문서유형",
+    "텍스트 개체 틀 2": "문서명",
+    "텍스트 개체 틀 3": "문서번호",
+    "텍스트 개체 틀 4": "버전",
+    "텍스트 개체 틀 5": "작성일",
+}
+RE_버전 = re.compile(r"^\d+(\.\d+)*$")
+RE_작성일 = re.compile(r"^\d{4}[.\-/]\d{1,2}[.\-/]\d{1,2}\.?$")
+
 # 본문 표의 크기와 (라벨셀, 값셀) 위치
 TABLE_SIZE = (4, 6)
 CELL_MAP = {
@@ -37,13 +54,15 @@ CELL_MAP = {
 CELL_UI흐름 = (3, 4)
 
 CHECKED = "■"
+DOC_HEADERS = ["문서키", "파일명", "문서번호", "문서명", "문서유형", "버전", "작성일", "UI건수"]
+DUP_HEADERS = ["UI_ID", "중복수", "UI명", "출처"]
 LIST_HEADERS = [
-    "파일명", "슬라이드", "대분류", "중분류", "소분류",
+    "UI_KEY", "파일명", "문서번호", "버전", "슬라이드", "대분류", "중분류", "소분류",
     "UI명", "UI_ID", "UI유형", "UI유형_원문", "UI설명",
     "화면정의", "업무처리흐름", "기타사항",
 ]
-FLOW_HEADERS = ["파일명", "슬라이드", "UI_ID", "UI명", "섹션", "순번", "내용"]
-ELEMENT_HEADERS = ["파일명", "슬라이드", "UI_ID", "UI명", "UI유형",
+FLOW_HEADERS = ["UI_KEY", "파일명", "슬라이드", "UI_ID", "UI명", "섹션", "순번", "내용"]
+ELEMENT_HEADERS = ["UI_KEY", "파일명", "슬라이드", "UI_ID", "UI명", "UI유형",
                    "영역", "영역구분", "순번", "요소명"]
 BUTTON_HEADERS = ["버튼명", "사용_화면수", "사용_화면"]
 
@@ -90,6 +109,70 @@ def find_spec_table(slide):
         if cell_text(table, 0, 0) == CELL_MAP["UI명"][2]:
             return table
     return None
+
+
+def extract_cover(prs, fallback_name):
+    """표지 슬라이드에서 문서 메타를 읽는다. 표지가 없으면 파일명으로 대체한다."""
+    meta = {h: "" for h in DOC_HEADERS}
+    warnings = []
+    cover = next((s for s in prs.slides if s.slide_layout.name == LAYOUT_표지), None)
+    if cover is None:
+        warnings.append("표지 슬라이드를 찾지 못해 문서 메타를 비워 둡니다")
+    else:
+        for shape in cover.shapes:
+            field = COVER_MAP.get(shape.name)
+            if field and shape.has_text_frame:
+                meta[field] = shape.text_frame.text.strip()
+    # 표지 양식이 다르면 엉뚱한 값이 들어오므로 형식을 가볍게 검사한다.
+    if meta["버전"] and not RE_버전.match(meta["버전"]):
+        warnings.append(f"버전 형식이 예상과 다릅니다: {meta['버전']!r}")
+    if meta["작성일"] and not RE_작성일.match(meta["작성일"]):
+        warnings.append(f"작성일 형식이 예상과 다릅니다: {meta['작성일']!r}")
+    if not meta["문서번호"]:
+        meta["문서번호"] = Path(fallback_name).stem
+        warnings.append("문서번호가 비어 있어 파일명으로 대체했습니다")
+    return meta, warnings
+
+
+def make_doc_key(meta, seen_docs):
+    """문서 하나를 가리키는 키. 예) NHNIS-BC-DS03-v0.7
+
+    같은 문서번호·버전이 두 번 들어오면(같은 파일을 두 번 받은 경우 등)
+    뒤에 #2 를 붙여 키가 겹치지 않게 한다. 키가 겹치면 시트 간 조인이
+    조용히 어긋나므로, 경고만 내고 넘어가지 않는다.
+    """
+    base = meta["문서번호"] + (f"-v{meta['버전']}" if meta["버전"] else "")
+    key, n = base, 1
+    while key in seen_docs:
+        n += 1
+        key = f"{base}#{n}"
+    seen_docs.add(key)
+    return key
+
+
+def make_ui_key(meta, slide_no):
+    """문서를 가로질러 UI 하나를 가리키는 키. 예) NHNIS-BC-DS03-v0.7-s4"""
+    return f"{meta['문서키']}-s{slide_no}"
+
+
+def build_duplicates(list_rows):
+    """같은 UI_ID 가 여러 문서·슬라이드에 나타나는 경우를 모은다."""
+    found = OrderedDict()
+    for row in list_rows:
+        found.setdefault(row["UI_ID"], []).append(row)
+    dups = []
+    for ui_id, rows in found.items():
+        if len(rows) < 2:
+            continue
+        names = sorted({r["UI명"] for r in rows})
+        dups.append({
+            "UI_ID": ui_id,
+            "중복수": len(rows),
+            "UI명": " / ".join(names),
+            "출처": ", ".join(r["UI_KEY"] for r in rows),
+        })
+    dups.sort(key=lambda r: (-r["중복수"], r["UI_ID"]))
+    return dups
 
 
 def normalize_ui_type(raw):
@@ -179,11 +262,15 @@ def build_button_inventory(element_rows):
     return rows
 
 
-def extract_slide(pptx_name, slide_no, slide, table):
+def extract_slide(pptx_name, meta, slide_no, slide, table):
     sections = parse_flow(table)
+    ui_key = make_ui_key(meta, slide_no)
 
     row = {h: "" for h in LIST_HEADERS}
+    row["UI_KEY"] = ui_key
     row["파일명"] = pptx_name
+    row["문서번호"] = meta["문서번호"]
+    row["버전"] = meta["버전"]
     row["슬라이드"] = slide_no
     row["대분류"] = find_shape_text(slide, SHAPE_대분류)
     row["중분류"] = find_shape_text(slide, SHAPE_중분류)
@@ -211,7 +298,7 @@ def extract_slide(pptx_name, slide_no, slide, table):
     for title, items in sections:
         for i, item in enumerate(items, 1):
             flow_rows.append({
-                "파일명": pptx_name, "슬라이드": slide_no,
+                "UI_KEY": ui_key, "파일명": pptx_name, "슬라이드": slide_no,
                 "UI_ID": row["UI_ID"], "UI명": row["UI명"],
                 "섹션": title, "순번": i, "내용": item,
             })
@@ -223,26 +310,32 @@ def extract_slide(pptx_name, slide_no, slide, table):
         for area, kind, elements in parse_areas(items):
             for i, element in enumerate(elements, 1):
                 element_rows.append({
-                    "파일명": pptx_name, "슬라이드": slide_no,
+                    "UI_KEY": ui_key, "파일명": pptx_name, "슬라이드": slide_no,
                     "UI_ID": row["UI_ID"], "UI명": row["UI명"], "UI유형": row["UI유형"],
                     "영역": area, "영역구분": kind, "순번": i, "요소명": element,
                 })
     return row, flow_rows, element_rows, warnings
 
 
-def extract_file(path):
+def extract_file(path, seen_docs):
     prs = Presentation(str(path))
-    list_rows, flow_rows, element_rows, warnings = [], [], [], []
+    meta, warnings = extract_cover(prs, path.name)
+    meta["파일명"] = path.name
+    meta["문서키"] = make_doc_key(meta, seen_docs)
+    if meta["문서키"].count("#"):
+        warnings.append(f"같은 문서번호·버전이 이미 있어 {meta['문서키']} 로 구분했습니다")
+    list_rows, flow_rows, element_rows = [], [], []
     for slide_no, slide in enumerate(prs.slides, 1):
         table = find_spec_table(slide)
         if table is None:
             continue
-        r, f, e, w = extract_slide(path.name, slide_no, slide, table)
+        r, f, e, w = extract_slide(path.name, meta, slide_no, slide, table)
         list_rows.append(r)
         flow_rows.extend(f)
         element_rows.extend(e)
         warnings.extend(w)
-    return list_rows, flow_rows, element_rows, warnings
+    meta["UI건수"] = len(list_rows)
+    return meta, list_rows, flow_rows, element_rows, warnings
 
 
 def write_csv(path, headers, rows):
@@ -271,17 +364,21 @@ def add_sheet(wb, title, headers, rows, widths):
     ws.auto_filter.ref = ws.dimensions
 
 
-def write_xlsx(path, list_rows, flow_rows, element_rows, button_rows):
+def write_xlsx(path, doc_rows, list_rows, flow_rows, element_rows, button_rows, dup_rows):
     wb = Workbook()
     wb.remove(wb.active)
+    add_sheet(wb, "문서", DOC_HEADERS, doc_rows,
+              [22, 40, 20, 36, 16, 8, 14, 10])
     add_sheet(wb, "UI목록", LIST_HEADERS, list_rows,
-              [28, 8, 16, 16, 20, 26, 14, 10, 22, 40, 50, 50, 40])
+              [24, 30, 18, 8, 8, 16, 16, 20, 26, 14, 10, 22, 40, 50, 50, 40])
     add_sheet(wb, "UI흐름_상세", FLOW_HEADERS, flow_rows,
-              [28, 8, 14, 26, 24, 6, 80])
+              [24, 30, 8, 14, 26, 24, 6, 80])
     add_sheet(wb, "화면요소", ELEMENT_HEADERS, element_rows,
-              [28, 8, 14, 26, 10, 18, 10, 6, 34])
+              [24, 30, 8, 14, 26, 10, 18, 10, 6, 34])
     add_sheet(wb, "버튼인벤토리", BUTTON_HEADERS, button_rows,
               [18, 12, 70])
+    add_sheet(wb, "중복점검", DUP_HEADERS, dup_rows,
+              [16, 8, 40, 70])
     wb.save(path)
 
 
@@ -289,38 +386,53 @@ def main():
     ap = argparse.ArgumentParser(description="UI 설계서 PPTX → CSV/Excel 추출기")
     ap.add_argument("source", help="PPTX 파일 또는 PPTX 가 들어 있는 폴더")
     ap.add_argument("-o", "--out", default="out", help="출력 폴더 (기본값 out)")
+    ap.add_argument("-r", "--recursive", action="store_true", help="하위 폴더까지 훑기")
     args = ap.parse_args()
 
     source = Path(args.source)
     if source.is_dir():
-        targets = sorted(p for p in source.glob("*.pptx") if not p.name.startswith("~$"))
+        found = source.rglob("*.pptx") if args.recursive else source.glob("*.pptx")
+        targets = sorted(p for p in found if not p.name.startswith("~$"))
     else:
         targets = [source]
     if not targets:
         sys.exit(f"처리할 pptx 가 없습니다. ({source})")
 
-    list_rows, flow_rows, element_rows = [], [], []
+    print(f"대상 {len(targets)}개 파일")
+    doc_rows, list_rows, flow_rows, element_rows = [], [], [], []
+    seen_docs = set()
     for target in targets:
-        rows, flows, elements, warnings = extract_file(target)
+        try:
+            meta, rows, flows, elements, warnings = extract_file(target, seen_docs)
+        except Exception as exc:  # 한 파일이 깨져도 나머지는 계속 처리한다
+            print(f"[오류] {target.name} — 건너뜁니다 ({exc})", file=sys.stderr)
+            continue
         for w in warnings:
             print(f"[경고] {target.name} — {w}", file=sys.stderr)
-        print(f"{target.name}: UI {len(rows)}건, 흐름 항목 {len(flows)}건, 화면요소 {len(elements)}건")
+        print(f"  {target.name}: UI {len(rows)}건, 흐름 {len(flows)}건, 요소 {len(elements)}건")
+        doc_rows.append(meta)
         list_rows.extend(rows)
         flow_rows.extend(flows)
         element_rows.extend(elements)
     button_rows = build_button_inventory(element_rows)
+    dup_rows = build_duplicates(list_rows)
 
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
+    write_csv(out / "doc_list.csv", DOC_HEADERS, doc_rows)
     write_csv(out / "ui_list.csv", LIST_HEADERS, list_rows)
     write_csv(out / "ui_flow.csv", FLOW_HEADERS, flow_rows)
     write_csv(out / "ui_element.csv", ELEMENT_HEADERS, element_rows)
-    write_xlsx(out / "ui_spec.xlsx", list_rows, flow_rows, element_rows, button_rows)
+    write_xlsx(out / "ui_spec.xlsx", doc_rows, list_rows, flow_rows,
+               element_rows, button_rows, dup_rows)
     print(f"\n완료 → {out.resolve()}")
+    print(f"  doc_list.csv   ({len(doc_rows)}행)")
     print(f"  ui_list.csv    ({len(list_rows)}행)")
     print(f"  ui_flow.csv    ({len(flow_rows)}행)")
     print(f"  ui_element.csv ({len(element_rows)}행, 버튼 {len(button_rows)}종)")
-    print("  ui_spec.xlsx   (UI목록 / UI흐름_상세 / 화면요소 / 버튼인벤토리)")
+    print("  ui_spec.xlsx   (문서 / UI목록 / UI흐름_상세 / 화면요소 / 버튼인벤토리 / 중복점검)")
+    if dup_rows:
+        print(f"\n[확인 필요] 같은 UI_ID 가 여러 곳에 있습니다 — {len(dup_rows)}종. 중복점검 시트를 보세요.")
 
 
 if __name__ == "__main__":
