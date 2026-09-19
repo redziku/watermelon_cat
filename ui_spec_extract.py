@@ -78,6 +78,7 @@ CONTEXT_HEADERS = ["UI_KEY", "문서번호", "버전", "슬라이드",
 FLOW_HEADERS = CONTEXT_HEADERS + ["섹션", "순번", "내용"]
 ELEMENT_HEADERS = CONTEXT_HEADERS + ["영역", "영역구분", "순번", "요소명"]
 BUTTON_HEADERS = ["버튼명", "사용_화면수", "사용_화면"]
+BTN_UI_HEADERS = ["UI_KEY", "대분류", "소분류", "UI_ID", "UI명", "UI유형", "버튼수", "버튼"]
 
 # UI흐름 섹션 제목 → 와이드 시트 컬럼명. 없는 제목은 기타사항으로 모은다.
 SECTION_COL = {
@@ -284,6 +285,20 @@ def parse_areas(lines):
     return areas
 
 
+def build_buttons_by_ui(list_rows):
+    """화면 하나에 버튼이 무엇이 있는지만 남긴 간단한 표."""
+    return [{h: row[h] for h in BTN_UI_HEADERS} for row in list_rows]
+
+
+def build_unknown_areas(element_rows):
+    """분류 규칙이 잡지 못한 영역 이름을 많이 나온 순으로 모은다."""
+    counts = OrderedDict()
+    for row in element_rows:
+        if row["영역구분"] == "기타":
+            counts[row["영역"]] = counts.get(row["영역"], 0) + 1
+    return sorted(counts.items(), key=lambda kv: -kv[1])
+
+
 def build_button_inventory(element_rows):
     """버튼 요소를 버튼명 기준으로 묶어 어느 화면에서 쓰는지 집계한다."""
     used = OrderedDict()
@@ -424,7 +439,8 @@ def add_sheet(wb, title, table_name, headers, rows, widths, wrap=True):
         ws.auto_filter.ref = ws.dimensions
 
 
-def write_xlsx(path, doc_rows, list_rows, flow_rows, element_rows, button_rows, dup_rows):
+def write_xlsx(path, doc_rows, list_rows, btn_ui_rows, flow_rows, element_rows,
+               button_rows, dup_rows):
     wb = Workbook()
     wb.remove(wb.active)
     context_widths = [42, 18, 8, 8, 16, 16, 20, 14, 26, 10]
@@ -433,6 +449,8 @@ def write_xlsx(path, doc_rows, list_rows, flow_rows, element_rows, button_rows, 
     add_sheet(wb, "UI목록", "t_ui", LIST_HEADERS, list_rows,
               [42, 46, 18, 8, 8, 16, 16, 20, 26, 14, 10, 22, 40,
                44, 44, 44, 24, 10, 8, 8, 50, 40])
+    add_sheet(wb, "화면별버튼", "t_btn_ui", BTN_UI_HEADERS, btn_ui_rows,
+              [42, 16, 22, 14, 30, 8, 8, 70])
     # 피벗 소스 두 장은 줄바꿈 없이 한 줄로 둬야 스크롤하며 훑기 좋다.
     add_sheet(wb, "화면요소", "t_element", ELEMENT_HEADERS, element_rows,
               context_widths + [18, 10, 6, 34], wrap=False)
@@ -497,8 +515,10 @@ def main():
         list_rows.extend(rows)
         flow_rows.extend(flows)
         element_rows.extend(elements)
+    btn_ui_rows = build_buttons_by_ui(list_rows)
     button_rows = build_button_inventory(element_rows)
     dup_rows = build_duplicates(list_rows)
+    unknown_areas = build_unknown_areas(element_rows)
 
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -506,14 +526,21 @@ def main():
     write_csv(out / "ui_list.csv", LIST_HEADERS, list_rows)
     write_csv(out / "ui_flow.csv", FLOW_HEADERS, flow_rows)
     write_csv(out / "ui_element.csv", ELEMENT_HEADERS, element_rows)
-    write_xlsx(out / "ui_spec.xlsx", doc_rows, list_rows, flow_rows,
+    write_xlsx(out / "ui_spec.xlsx", doc_rows, list_rows, btn_ui_rows, flow_rows,
                element_rows, button_rows, dup_rows)
     print(f"\n완료 → {out.resolve()}")
     print(f"  doc_list.csv   ({len(doc_rows)}행)")
     print(f"  ui_list.csv    ({len(list_rows)}행)")
     print(f"  ui_flow.csv    ({len(flow_rows)}행)")
     print(f"  ui_element.csv ({len(element_rows)}행, 버튼 {len(button_rows)}종)")
-    print("  ui_spec.xlsx   (문서 / UI목록 / 화면요소 / UI흐름_상세 / 버튼인벤토리 / 중복점검)")
+    print("  ui_spec.xlsx   (문서 / UI목록 / 화면별버튼 / 화면요소 / UI흐름_상세 / "
+          "버튼인벤토리 / 중복점검)")
+    if unknown_areas:
+        total = sum(n for _, n in unknown_areas)
+        print(f"\n[확인 필요] 분류하지 못한 영역 {len(unknown_areas)}종 / {total}건 — "
+              "아래 이름을 알려주시면 규칙에 넣겠습니다.")
+        for name, count in unknown_areas:
+            print(f"    {count:5d}건  {name!r}")
     if dup_rows:
         print(f"\n[확인 필요] 같은 UI_ID 가 여러 곳에 있습니다 — {len(dup_rows)}종. 중복점검 시트를 보세요.")
     if failed:
