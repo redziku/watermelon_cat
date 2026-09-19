@@ -42,6 +42,12 @@ COVER_MAP = {
     "텍스트 개체 틀 4": "버전",
     "텍스트 개체 틀 5": "작성일",
 }
+# 엑셀 셀에 넣을 수 없는 제어문자. 파워포인트에서 Shift+Enter 로 넣은
+# 줄바꿈은 \x0b(수직 탭)로 들어오는데 openpyxl 이 이를 거부한다.
+RE_제어문자 = re.compile(r"[\x00-\x08\x0e-\x1f]")
+# 문서명은 'BI포탈_신용실적 – 04.여신실적(1)' 처럼 뒤에 편 이름이 붙는다.
+# 공백으로 둘러싸인 대시만 구분자로 봐야 'NHNIS-BC-DS03' 이 잘리지 않는다.
+SEP_문서명 = re.compile(r"\s[–—-]\s")
 RE_버전 = re.compile(r"^\d+(\.\d+)*$")
 RE_작성일 = re.compile(r"^\d{4}[.\-/]\d{1,2}[.\-/]\d{1,2}\.?$")
 
@@ -56,7 +62,8 @@ CELL_MAP = {
 CELL_UI흐름 = (3, 4)
 
 CHECKED = "■"
-DOC_HEADERS = ["문서키", "파일명", "문서번호", "문서명", "문서유형", "버전", "작성일", "UI건수"]
+DOC_HEADERS = ["문서키", "파일명", "문서번호", "구분", "문서명", "문서유형",
+               "버전", "작성일", "UI건수"]
 DUP_HEADERS = ["UI_ID", "중복수", "UI명", "출처"]
 LIST_HEADERS = [
     "UI_KEY", "파일명", "문서번호", "버전", "슬라이드", "대분류", "중분류", "소분류",
@@ -100,14 +107,27 @@ AREA_KIND = [
 ]
 
 
+def clean_text(text):
+    """엑셀에 넣을 수 있는 문자만 남긴다.
+
+    파워포인트의 줄바꿈(\x0b)과 페이지 구분(\x0c)은 줄바꿈으로 바꾸고,
+    나머지 제어문자는 버린다. 이 처리를 빼면 openpyxl 이
+    IllegalCharacterError 로 죽는데, 그 시점이 모든 파일을 다 읽은
+    마지막 저장 단계라 작업을 통째로 날리게 된다.
+    """
+    text = (text.replace("\v", "\n").replace("\f", "\n")
+                .replace("\r\n", "\n").replace("\r", "\n"))
+    return RE_제어문자.sub("", text)
+
+
 def cell_text(table, row, col):
-    return table.cell(row, col).text.strip()
+    return clean_text(table.cell(row, col).text).strip()
 
 
 def find_shape_text(slide, name):
     for shape in slide.shapes:
         if shape.name == name and shape.has_text_frame:
-            return shape.text_frame.text.strip()
+            return clean_text(shape.text_frame.text).strip()
     return ""
 
 
@@ -135,7 +155,7 @@ def extract_cover(prs, fallback_name):
         for shape in cover.shapes:
             field = COVER_MAP.get(shape.name)
             if field and shape.has_text_frame:
-                meta[field] = shape.text_frame.text.strip()
+                meta[field] = clean_text(shape.text_frame.text).strip()
     # 표지 양식이 다르면 엉뚱한 값이 들어오므로 형식을 가볍게 검사한다.
     if meta["버전"] and not RE_버전.match(meta["버전"]):
         warnings.append(f"버전 형식이 예상과 다릅니다: {meta['버전']!r}")
@@ -144,6 +164,10 @@ def extract_cover(prs, fallback_name):
     if not meta["문서번호"]:
         meta["문서번호"] = Path(fallback_name).stem
         warnings.append("문서번호가 비어 있어 파일명으로 대체했습니다")
+    # 한 문서번호 아래 여러 편으로 나뉘어 있으므로 편 이름까지 있어야 구분된다.
+    parts = SEP_문서명.split(meta["문서명"])
+    meta["구분"] = (parts[-1].strip() if len(parts) > 1
+                  else meta["문서명"].strip() or Path(fallback_name).stem)
     return meta, warnings
 
 
@@ -154,7 +178,8 @@ def make_doc_key(meta, seen_docs):
     뒤에 #2 를 붙여 키가 겹치지 않게 한다. 키가 겹치면 시트 간 조인이
     조용히 어긋나므로, 경고만 내고 넘어가지 않는다.
     """
-    base = meta["문서번호"] + (f"-v{meta['버전']}" if meta["버전"] else "")
+    base = "-".join(filter(None, [meta["문서번호"], meta["구분"],
+                                  f"v{meta['버전']}" if meta["버전"] else ""]))
     key, n = base, 1
     while key in seen_docs:
         n += 1
@@ -206,7 +231,7 @@ def parse_flow(table):
     cell = table.cell(*CELL_UI흐름)
     sections = []
     for para in cell.text_frame.paragraphs:
-        text = para.text.strip()
+        text = clean_text(para.text).strip()
         if not text:
             continue
         if para.level == 0:
@@ -346,7 +371,8 @@ def extract_file(path, seen_docs):
     meta["파일명"] = path.name
     meta["문서키"] = make_doc_key(meta, seen_docs)
     if meta["문서키"].count("#"):
-        warnings.append(f"같은 문서번호·버전이 이미 있어 {meta['문서키']} 로 구분했습니다")
+        warnings.append(f"문서키가 앞선 파일과 겹쳐 {meta['문서키']} 로 구분했습니다. "
+                        "표지의 문서명이 같은 파일이 둘 이상인지 확인하세요")
     list_rows, flow_rows, element_rows = [], [], []
     for slide_no, slide in enumerate(prs.slides, 1):
         table = find_spec_table(slide)
@@ -377,7 +403,10 @@ def add_sheet(wb, title, table_name, headers, rows, widths, wrap=True):
         cell.fill = PatternFill("solid", fgColor="4472C4")
         cell.alignment = Alignment(horizontal="center", vertical="center")
     for row in rows:
-        ws.append([row[h] for h in headers])
+        # 읽는 쪽에서 이미 정리하지만, 저장 단계에서 죽으면 전체를 날리므로
+        # 여기서 한 번 더 막는다.
+        ws.append([clean_text(row[h]) if isinstance(row[h], str) else row[h]
+                   for h in headers])
     for i, width in enumerate(widths, 1):
         ws.column_dimensions[get_column_letter(i)].width = width
     for row in ws.iter_rows(min_row=2):
@@ -398,11 +427,11 @@ def add_sheet(wb, title, table_name, headers, rows, widths, wrap=True):
 def write_xlsx(path, doc_rows, list_rows, flow_rows, element_rows, button_rows, dup_rows):
     wb = Workbook()
     wb.remove(wb.active)
-    context_widths = [24, 18, 8, 8, 16, 16, 20, 14, 26, 10]
+    context_widths = [42, 18, 8, 8, 16, 16, 20, 14, 26, 10]
     add_sheet(wb, "문서", "t_doc", DOC_HEADERS, doc_rows,
-              [22, 40, 20, 36, 16, 8, 14, 10])
+              [42, 46, 18, 20, 32, 14, 8, 14, 10])
     add_sheet(wb, "UI목록", "t_ui", LIST_HEADERS, list_rows,
-              [24, 30, 18, 8, 8, 16, 16, 20, 26, 14, 10, 22, 40,
+              [42, 46, 18, 8, 8, 16, 16, 20, 26, 14, 10, 22, 40,
                44, 44, 44, 24, 10, 8, 8, 50, 40])
     # 피벗 소스 두 장은 줄바꿈 없이 한 줄로 둬야 스크롤하며 훑기 좋다.
     add_sheet(wb, "화면요소", "t_element", ELEMENT_HEADERS, element_rows,
@@ -412,7 +441,7 @@ def write_xlsx(path, doc_rows, list_rows, flow_rows, element_rows, button_rows, 
     add_sheet(wb, "버튼인벤토리", "t_button", BUTTON_HEADERS, button_rows,
               [18, 12, 70])
     add_sheet(wb, "중복점검", "t_dup", DUP_HEADERS, dup_rows,
-              [16, 8, 40, 70])
+              [16, 8, 40, 90])
     wb.save(path)
 
 
