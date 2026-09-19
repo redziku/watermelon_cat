@@ -14,6 +14,7 @@ UI_KEY 컬럼이 문서를 가로질러 UI 하나를 가리키는 키가 된다.
 """
 import argparse
 import csv
+import datetime
 import re
 import sys
 import traceback
@@ -22,13 +23,14 @@ from pathlib import Path
 
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.worksheet.hyperlink import Hyperlink
 from openpyxl.worksheet.table import Table, TableStyleInfo
 from openpyxl.utils import get_column_letter
 from pptx import Presentation
 
 # 실행 로그에 찍어 어떤 버전이 돌았는지 확인할 수 있게 한다.
 # 스크립트를 고칠 때마다 올린다.
-VERSION = "2026-09-19g"
+VERSION = "2026-09-19h"
 
 # ── 템플릿 매핑 ──────────────────────────────────────────────
 # 슬라이드 상단 플레이스홀더의 도형 이름
@@ -578,6 +580,72 @@ def add_sheet(wb, title, table_name, headers, rows, widths, wrap=True):
         ws.auto_filter.ref = ws.dimensions
 
 
+# 읽기안내 시트에 실을 역할별 길잡이. (역할, 시트, 설명)
+GUIDE_ROWS = [
+    ("전원 — 여기서 시작", "UI목록",
+     "화면 마스터입니다. 대분류 열에 필터를 걸어 담당 영역만 보세요."),
+    ("전체 조망", "문서",
+     "설계서 편별로 화면이 몇 건인지, 버전과 작성일은 어떻게 되는지."),
+    ("개발 · 아키텍트", "화면별버튼",
+     "행이 화면, 열이 버튼인 매트릭스입니다. 많이 쓰는 버튼이 왼쪽에 있어, "
+     "왼쪽 덩어리에 생긴 구멍이 곧 공통 버튼이 빠진 화면입니다."),
+    ("개발 · 아키텍트", "버튼인벤토리",
+     "버튼이 각각 몇 개 화면에 쓰이는지. 공통 컴포넌트를 어디까지 만들지 정할 때."),
+    ("QA · 테스터", "UI흐름_상세",
+     "업무처리 흐름을 한 줄씩 분리했습니다. 한 줄이 곧 테스트케이스 후보입니다."),
+    ("분석 · 집계", "화면요소",
+     "피벗 소스입니다. 이 시트만 선택하고 삽입 > 피벗테이블을 누르면 됩니다. "
+     "분류 컬럼이 이미 들어 있어 다른 시트와 연결할 필요가 없습니다."),
+    ("설계서 작성자", "중복점검",
+     "같은 UI_ID 가 여러 곳에 있는 건입니다. 출처의 문서키가 서로 다르면 "
+     "공통 화면이 여러 편에 실린 것이고, 같으면 설계서 오류입니다."),
+]
+GUIDE_NOTES = [
+    "이 파일은 PPT 설계서에서 뽑아낸 결과물입니다. 내용을 고치려면 원본 PPT 를 고쳐 주세요.",
+    "다시 추출하면 이 파일은 통째로 덮어써집니다. 메모나 작업은 사본을 만들어서 하세요.",
+    "시트끼리는 UI_KEY 로 이어집니다. 한 화면이 여러 장에 걸쳐 있으면 한 건으로 합쳐 뒀습니다.",
+]
+
+
+def add_guide_sheet(wb, stats):
+    """맨 앞에 읽는 순서를 안내하는 시트를 둔다. 시트명은 하이퍼링크로 건다."""
+    ws = wb.create_sheet("읽기안내")
+    ws.sheet_properties.tabColor = "FFC000"
+    ws["A1"] = "UI 설계서 데이터 — 읽는 순서"
+    ws["A1"].font = Font(bold=True, size=16)
+    ws["A3"] = f"생성 {datetime.datetime.now():%Y-%m-%d %H:%M}   ui_spec_extract {VERSION}"
+    ws["A4"] = stats
+    for row in ("A3", "A4"):
+        ws[row].font = Font(color="666666")
+
+    ws.append([])
+    ws.append(["역할", "먼저 볼 시트", "무엇을 하나"])
+    header = ws[ws.max_row]
+    for cell in header:
+        cell.font = Font(bold=True, color="FFFFFF")
+        cell.fill = PatternFill("solid", fgColor="4472C4")
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+
+    for role, sheet, note in GUIDE_ROWS:
+        ws.append([role, sheet, note])
+        link = ws.cell(row=ws.max_row, column=2)
+        link.hyperlink = Hyperlink(ref=link.coordinate, location=f"'{sheet}'!A1")
+        link.font = Font(color="0563C1", underline="single")
+
+    ws.append([])
+    ws.append(["알아두실 점"])
+    ws[f"A{ws.max_row}"].font = Font(bold=True)
+    for note in GUIDE_NOTES:
+        ws.append(["", "", note])
+
+    for column, width in zip("ABC", (22, 16, 96)):
+        ws.column_dimensions[column].width = width
+    for row in ws.iter_rows(min_row=6):
+        for cell in row:
+            cell.alignment = Alignment(vertical="center", wrap_text=True)
+    ws.sheet_view.showGridLines = False
+
+
 def add_matrix_sheet(wb, title, table_name, headers, rows, base_count):
     """고정 컬럼 + 표시 컬럼으로 된 매트릭스 시트."""
     ws = wb.create_sheet(title)
@@ -621,10 +689,13 @@ def write_xlsx(path, doc_rows, list_rows, matrix, flow_rows, element_rows,
                button_rows, dup_rows):
     wb = Workbook()
     wb.remove(wb.active)
+    # 파일을 열면 가장 먼저 보이도록 안내 시트를 맨 앞에 만든다.
+    add_guide_sheet(wb, f"문서 {len(doc_rows):,}건 · 화면 {len(list_rows):,}건 · "
+                        f"화면요소 {len(element_rows):,}행 · 흐름 {len(flow_rows):,}행 · "
+                        f"버튼 {len(button_rows):,}종")
     context_widths = [42, 18, 8, 8, 16, 16, 20, 14, 26, 10]
     add_sheet(wb, "문서", "t_doc", DOC_HEADERS, doc_rows,
               [42, 46, 18, 20, 32, 14, 8, 14, 10])
-    _ = MATRIX_BASE_WIDTHS  # 매트릭스 시트가 쓰는 고정 컬럼 폭
     add_sheet(wb, "UI목록", "t_ui", LIST_HEADERS, list_rows,
               [42, 46, 18, 8, 8, 12, 8, 16, 16, 20, 26, 14, 10, 22, 40,
                44, 44, 44, 44, 24, 10, 8, 8, 8, 50, 40])
@@ -640,6 +711,7 @@ def write_xlsx(path, doc_rows, list_rows, matrix, flow_rows, element_rows,
               [18, 12, 70])
     add_sheet(wb, "중복점검", "t_dup", DUP_HEADERS, dup_rows,
               [16, 8, 40, 90])
+    wb.active = 0
     wb.save(path)
 
 
@@ -747,8 +819,8 @@ def main():
     print(f"  ui_list.csv    ({len(list_rows)}행)")
     print(f"  ui_flow.csv    ({len(flow_rows)}행)")
     print(f"  ui_element.csv ({len(element_rows)}행, 버튼 {len(button_rows)}종)")
-    print("  ui_spec.xlsx   (문서 / UI목록 / 화면별버튼 / 화면요소 / UI흐름_상세 / "
-          "버튼인벤토리 / 중복점검)")
+    print("  ui_spec.xlsx   (읽기안내 / 문서 / UI목록 / 화면별버튼 / 화면요소 / "
+          "UI흐름_상세 / 버튼인벤토리 / 중복점검)")
     if unknown_areas:
         total = sum(n for _, n in unknown_areas)
         print(f"\n[확인 필요] 분류하지 못한 영역 {len(unknown_areas)}종 / {total}건 — "
