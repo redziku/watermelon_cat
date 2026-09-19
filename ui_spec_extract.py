@@ -16,6 +16,7 @@ import argparse
 import csv
 import re
 import sys
+import traceback
 from collections import OrderedDict
 from pathlib import Path
 
@@ -415,7 +416,17 @@ def write_xlsx(path, doc_rows, list_rows, flow_rows, element_rows, button_rows, 
     wb.save(path)
 
 
+def make_console_safe():
+    """윈도우 기본 콘솔(cp949)에서 표현 못 하는 글자 때문에 죽지 않게 한다."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")
+        except (AttributeError, OSError):
+            pass
+
+
 def main():
+    make_console_safe()
     ap = argparse.ArgumentParser(description="UI 설계서 PPTX → CSV/Excel 추출기")
     ap.add_argument("source", help="PPTX 파일 또는 PPTX 가 들어 있는 폴더")
     ap.add_argument("-o", "--out", default="out", help="출력 폴더 (기본값 out)")
@@ -434,15 +445,25 @@ def main():
     print(f"대상 {len(targets)}개 파일")
     doc_rows, list_rows, flow_rows, element_rows = [], [], [], []
     seen_docs = set()
-    for target in targets:
+    failed = []
+    for i, target in enumerate(targets, 1):
+        # 어떤 파일을 붙들고 있는지 먼저 알려야 멈춘 것과 느린 것을 구분할 수 있다.
+        # 구글드라이브 스트리밍 폴더는 첫 읽기에서 내려받느라 오래 걸린다.
+        size_mb = target.stat().st_size / 1024 / 1024
+        print(f"  [{i}/{len(targets)}] {target.name} ({size_mb:.1f}MB) 처리 중 ...",
+              end="", flush=True)
         try:
             meta, rows, flows, elements, warnings = extract_file(target, seen_docs)
         except Exception as exc:  # 한 파일이 깨져도 나머지는 계속 처리한다
-            print(f"[오류] {target.name} — 건너뜁니다 ({exc})", file=sys.stderr)
+            print(" 실패")
+            print(f"[오류] {target.name} — 건너뜁니다", file=sys.stderr)
+            print(f"       {type(exc).__name__}: {exc}", file=sys.stderr)
+            traceback.print_exc(file=sys.stderr)
+            failed.append(target.name)
             continue
+        print(f" UI {len(rows)}건, 흐름 {len(flows)}건, 요소 {len(elements)}건")
         for w in warnings:
             print(f"[경고] {target.name} — {w}", file=sys.stderr)
-        print(f"  {target.name}: UI {len(rows)}건, 흐름 {len(flows)}건, 요소 {len(elements)}건")
         doc_rows.append(meta)
         list_rows.extend(rows)
         flow_rows.extend(flows)
@@ -466,6 +487,8 @@ def main():
     print("  ui_spec.xlsx   (문서 / UI목록 / 화면요소 / UI흐름_상세 / 버튼인벤토리 / 중복점검)")
     if dup_rows:
         print(f"\n[확인 필요] 같은 UI_ID 가 여러 곳에 있습니다 — {len(dup_rows)}종. 중복점검 시트를 보세요.")
+    if failed:
+        print(f"\n[확인 필요] 처리하지 못한 파일 {len(failed)}개 — {', '.join(failed)}")
 
 
 if __name__ == "__main__":
