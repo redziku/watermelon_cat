@@ -68,8 +68,8 @@ DUP_HEADERS = ["UI_ID", "중복수", "UI명", "출처"]
 LIST_HEADERS = [
     "UI_KEY", "파일명", "문서번호", "버전", "슬라이드", "대분류", "중분류", "소분류",
     "UI명", "UI_ID", "UI유형", "UI유형_원문", "UI설명",
-    "조회조건", "버튼", "데이터", "기타영역",
-    "조회조건수", "버튼수", "데이터수",
+    "조회조건", "입력", "버튼", "데이터", "기타영역",
+    "조회조건수", "입력수", "버튼수", "데이터수",
     "업무처리흐름", "기타사항",
 ]
 # 롱 시트는 피벗 소스로 쓰므로 분류 컬럼을 함께 실어 단독으로 집계되게 한다.
@@ -93,6 +93,7 @@ SECTION_화면정의 = "화면정의"
 # 영역구분 → UI목록의 목록 컬럼 / 개수 컬럼
 AREA_COL = {
     "조회조건": ("조회조건", "조회조건수"),
+    "입력": ("입력", "입력수"),
     "버튼": ("버튼", "버튼수"),
     "데이터": ("데이터", "데이터수"),
     "기타": ("기타영역", None),
@@ -104,10 +105,17 @@ AREA_SEP = re.compile(r"[:：]")
 # 키워드로 분류한다. 위에서부터 먼저 맞는 것을 쓴다.
 AREA_KIND = [
     ("버튼", "버튼"),
+    # '출력 조건 영역' 처럼 조건이 들어가면 먼저 조회조건으로 본다.
     ("조건", "조회조건"),
     ("조회", "조회조건"),
+    # 등록·입력은 값을 넣는 곳이라 걸러 보는 조회조건과 성격이 다르다.
+    ("등록", "입력"),
+    ("입력", "입력"),
     ("데이터", "데이터"),
     ("결과", "데이터"),
+    # 코드관리 화면의 '그룹코드 영역', '상세코드 영역' 등은 데이터 목록이다.
+    ("코드", "데이터"),
+    ("카테고리", "데이터"),
 ]
 
 
@@ -276,15 +284,22 @@ def classify_area(name):
 
 
 def parse_areas(lines):
-    """화면 정의 항목을 (영역명, 영역구분, [요소]) 로 만든다."""
+    """화면 정의 항목을 [영역명, 영역구분, [요소]] 로 만든다.
+
+    콜론이 없는 줄은 앞 영역이 다음 줄로 이어진 것으로 본다. 작성자가
+    Shift+Enter 대신 Enter 를 눌러 항목이 문단째로 나뉜 경우인데,
+    새 영역으로 세면 이름 없는 '(미분류)' 가 쌓인다.
+    """
     areas = []
     for line in lines:
         parts = AREA_SEP.split(line, 1)
         if len(parts) == 2:
             name = " ".join(parts[0].split())
-            areas.append((name, classify_area(name), split_items(parts[1])))
+            areas.append([name, classify_area(name), split_items(parts[1])])
+        elif areas:
+            areas[-1][2].extend(split_items(line))
         else:
-            areas.append(("(미분류)", "기타", [" ".join(line.split())]))
+            areas.append(["(미분류)", "기타", split_items(line)])
     return areas
 
 
@@ -519,7 +534,7 @@ def write_xlsx(path, doc_rows, list_rows, matrix, flow_rows, element_rows,
     _ = MATRIX_BASE_WIDTHS  # 매트릭스 시트가 쓰는 고정 컬럼 폭
     add_sheet(wb, "UI목록", "t_ui", LIST_HEADERS, list_rows,
               [42, 46, 18, 8, 8, 16, 16, 20, 26, 14, 10, 22, 40,
-               44, 44, 44, 24, 10, 8, 8, 50, 40])
+               44, 44, 44, 44, 24, 10, 8, 8, 8, 50, 40])
     matrix_headers, matrix_rows = matrix
     add_matrix_sheet(wb, "화면별버튼", "t_btn_ui", matrix_headers, matrix_rows,
                      len(BTN_MATRIX_BASE))
