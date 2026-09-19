@@ -21,6 +21,7 @@ from pathlib import Path
 
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.worksheet.table import Table, TableStyleInfo
 from openpyxl.utils import get_column_letter
 from pptx import Presentation
 
@@ -59,11 +60,15 @@ DUP_HEADERS = ["UI_ID", "중복수", "UI명", "출처"]
 LIST_HEADERS = [
     "UI_KEY", "파일명", "문서번호", "버전", "슬라이드", "대분류", "중분류", "소분류",
     "UI명", "UI_ID", "UI유형", "UI유형_원문", "UI설명",
-    "화면정의", "업무처리흐름", "기타사항",
+    "조회조건", "버튼", "데이터", "기타영역",
+    "조회조건수", "버튼수", "데이터수",
+    "업무처리흐름", "기타사항",
 ]
-FLOW_HEADERS = ["UI_KEY", "파일명", "슬라이드", "UI_ID", "UI명", "섹션", "순번", "내용"]
-ELEMENT_HEADERS = ["UI_KEY", "파일명", "슬라이드", "UI_ID", "UI명", "UI유형",
-                   "영역", "영역구분", "순번", "요소명"]
+# 롱 시트는 피벗 소스로 쓰므로 분류 컬럼을 함께 실어 단독으로 집계되게 한다.
+CONTEXT_HEADERS = ["UI_KEY", "문서번호", "버전", "슬라이드",
+                   "대분류", "중분류", "소분류", "UI_ID", "UI명", "UI유형"]
+FLOW_HEADERS = CONTEXT_HEADERS + ["섹션", "순번", "내용"]
+ELEMENT_HEADERS = CONTEXT_HEADERS + ["영역", "영역구분", "순번", "요소명"]
 BUTTON_HEADERS = ["버튼명", "사용_화면수", "사용_화면"]
 
 # UI흐름 섹션 제목 → 와이드 시트 컬럼명. 없는 제목은 기타사항으로 모은다.
@@ -73,6 +78,13 @@ SECTION_COL = {
     "기타 제약조건 및 특이사항": "기타사항",
 }
 SECTION_화면정의 = "화면정의"
+# 영역구분 → UI목록의 목록 컬럼 / 개수 컬럼
+AREA_COL = {
+    "조회조건": ("조회조건", "조회조건수"),
+    "버튼": ("버튼", "버튼수"),
+    "데이터": ("데이터", "데이터수"),
+    "기타": ("기타영역", None),
+}
 
 # '<영역명> : a, b, c' 를 쪼갤 때 쓰는 구분자
 AREA_SEP = re.compile(r"[:：]")
@@ -284,9 +296,12 @@ def extract_slide(pptx_name, meta, slide_no, slide, table):
         row[field] = cell_text(table, *value_pos)
     row["UI유형"] = normalize_ui_type(row["UI유형_원문"])
 
+    # 화면 정의를 뺀 나머지 섹션을 해당 컬럼에 담는다.
     기타 = []
     for title, items in sections:
         col = SECTION_COL.get(title)
+        if col == SECTION_화면정의:
+            continue
         if col:
             row[col] = "\n".join(items)
         else:
@@ -294,14 +309,13 @@ def extract_slide(pptx_name, meta, slide_no, slide, table):
     if 기타:
         row["기타사항"] = "\n".join(filter(None, [row["기타사항"], *기타]))
 
+    # 롱 시트가 단독으로 피벗되도록 분류 컬럼을 그대로 복사해 붙인다.
+    context = {h: row[h] for h in CONTEXT_HEADERS}
+
     flow_rows = []
     for title, items in sections:
         for i, item in enumerate(items, 1):
-            flow_rows.append({
-                "UI_KEY": ui_key, "파일명": pptx_name, "슬라이드": slide_no,
-                "UI_ID": row["UI_ID"], "UI명": row["UI명"],
-                "섹션": title, "순번": i, "내용": item,
-            })
+            flow_rows.append({**context, "섹션": title, "순번": i, "내용": item})
 
     element_rows = []
     for title, items in sections:
@@ -309,11 +323,19 @@ def extract_slide(pptx_name, meta, slide_no, slide, table):
             continue
         for area, kind, elements in parse_areas(items):
             for i, element in enumerate(elements, 1):
-                element_rows.append({
-                    "UI_KEY": ui_key, "파일명": pptx_name, "슬라이드": slide_no,
-                    "UI_ID": row["UI_ID"], "UI명": row["UI명"], "UI유형": row["UI유형"],
-                    "영역": area, "영역구분": kind, "순번": i, "요소명": element,
-                })
+                element_rows.append({**context, "영역": area, "영역구분": kind,
+                                     "순번": i, "요소명": element})
+
+    # 화면 정의를 영역구분별로 묶어 UI목록에서 한 줄로 훑어볼 수 있게 한다.
+    by_kind = OrderedDict()
+    for element in element_rows:
+        by_kind.setdefault(element["영역구분"], []).append(element["요소명"])
+    for kind, (list_col, count_col) in AREA_COL.items():
+        picked = by_kind.get(kind, [])
+        row[list_col] = ", ".join(picked)
+        if count_col:
+            row[count_col] = len(picked)
+
     return row, flow_rows, element_rows, warnings
 
 
@@ -346,7 +368,7 @@ def write_csv(path, headers, rows):
         writer.writerows(rows)
 
 
-def add_sheet(wb, title, headers, rows, widths):
+def add_sheet(wb, title, table_name, headers, rows, widths, wrap=True):
     ws = wb.create_sheet(title)
     ws.append(headers)
     for cell in ws[1]:
@@ -359,25 +381,36 @@ def add_sheet(wb, title, headers, rows, widths):
         ws.column_dimensions[get_column_letter(i)].width = width
     for row in ws.iter_rows(min_row=2):
         for cell in row:
-            cell.alignment = Alignment(vertical="top", wrap_text=True)
+            cell.alignment = Alignment(vertical="top", wrap_text=wrap)
     ws.freeze_panes = "A2"
-    ws.auto_filter.ref = ws.dimensions
+    if rows:
+        # 엑셀 '표' 로 만들어 두면 피벗테이블을 만들 때 범위가 자동으로 잡히고,
+        # 행이 늘어도 범위를 다시 지정할 필요가 없다.
+        table = Table(displayName=table_name, ref=ws.dimensions)
+        table.tableStyleInfo = TableStyleInfo(name="TableStyleMedium2",
+                                              showRowStripes=True)
+        ws.add_table(table)
+    else:
+        ws.auto_filter.ref = ws.dimensions
 
 
 def write_xlsx(path, doc_rows, list_rows, flow_rows, element_rows, button_rows, dup_rows):
     wb = Workbook()
     wb.remove(wb.active)
-    add_sheet(wb, "문서", DOC_HEADERS, doc_rows,
+    context_widths = [24, 18, 8, 8, 16, 16, 20, 14, 26, 10]
+    add_sheet(wb, "문서", "t_doc", DOC_HEADERS, doc_rows,
               [22, 40, 20, 36, 16, 8, 14, 10])
-    add_sheet(wb, "UI목록", LIST_HEADERS, list_rows,
-              [24, 30, 18, 8, 8, 16, 16, 20, 26, 14, 10, 22, 40, 50, 50, 40])
-    add_sheet(wb, "UI흐름_상세", FLOW_HEADERS, flow_rows,
-              [24, 30, 8, 14, 26, 24, 6, 80])
-    add_sheet(wb, "화면요소", ELEMENT_HEADERS, element_rows,
-              [24, 30, 8, 14, 26, 10, 18, 10, 6, 34])
-    add_sheet(wb, "버튼인벤토리", BUTTON_HEADERS, button_rows,
+    add_sheet(wb, "UI목록", "t_ui", LIST_HEADERS, list_rows,
+              [24, 30, 18, 8, 8, 16, 16, 20, 26, 14, 10, 22, 40,
+               44, 44, 44, 24, 10, 8, 8, 50, 40])
+    # 피벗 소스 두 장은 줄바꿈 없이 한 줄로 둬야 스크롤하며 훑기 좋다.
+    add_sheet(wb, "화면요소", "t_element", ELEMENT_HEADERS, element_rows,
+              context_widths + [18, 10, 6, 34], wrap=False)
+    add_sheet(wb, "UI흐름_상세", "t_flow", FLOW_HEADERS, flow_rows,
+              context_widths + [24, 6, 80], wrap=False)
+    add_sheet(wb, "버튼인벤토리", "t_button", BUTTON_HEADERS, button_rows,
               [18, 12, 70])
-    add_sheet(wb, "중복점검", DUP_HEADERS, dup_rows,
+    add_sheet(wb, "중복점검", "t_dup", DUP_HEADERS, dup_rows,
               [16, 8, 40, 70])
     wb.save(path)
 
@@ -430,7 +463,7 @@ def main():
     print(f"  ui_list.csv    ({len(list_rows)}행)")
     print(f"  ui_flow.csv    ({len(flow_rows)}행)")
     print(f"  ui_element.csv ({len(element_rows)}행, 버튼 {len(button_rows)}종)")
-    print("  ui_spec.xlsx   (문서 / UI목록 / UI흐름_상세 / 화면요소 / 버튼인벤토리 / 중복점검)")
+    print("  ui_spec.xlsx   (문서 / UI목록 / 화면요소 / UI흐름_상세 / 버튼인벤토리 / 중복점검)")
     if dup_rows:
         print(f"\n[확인 필요] 같은 UI_ID 가 여러 곳에 있습니다 — {len(dup_rows)}종. 중복점검 시트를 보세요.")
 
